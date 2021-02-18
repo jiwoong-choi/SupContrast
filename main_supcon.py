@@ -8,20 +8,14 @@ import math
 
 import tensorboard_logger as tb_logger
 import torch
-import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
+import poptorch
 
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
 from util import set_optimizer, save_model
 from networks.resnet_big import SupConResNet
 from losses import SupConLoss
-
-try:
-    import apex
-    from apex import amp, optimizers
-except ImportError:
-    pass
 
 
 def parse_option():
@@ -176,25 +170,40 @@ def set_loader(opt):
     return train_loader
 
 
+class ModelWithLoss(torch.nn.Module):
+    def __init__(self, model, loss, method):
+        super().__init__()
+        self.model = model
+        self.loss = loss
+        self.method = method
+
+    def forward(self, x, label):
+        bsz = label.shape[0]
+        features = self.model(x)
+        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+        features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+
+        if self.method == 'SupCon':
+            loss = self.loss(features, label)
+        elif self.method == 'SimCLR':
+            loss = self.loss(features)
+        else:
+            raise ValueError('contrastive method not supported: {}'.
+                             format(self.method))
+
+        return x, loss
+
+
 def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
-    # enable synchronized Batch Normalization
-    if opt.syncBN:
-        model = apex.parallel.convert_syncbn_model(model)
+    model_with_loss = ModelWithLoss(model, criterion, opt.method)
 
-    if torch.cuda.is_available():
-        if torch.cuda.device_count() > 1:
-            model.encoder = torch.nn.DataParallel(model.encoder)
-        model = model.cuda()
-        criterion = criterion.cuda()
-        cudnn.benchmark = True
-
-    return model, criterion
+    return model_with_loss
 
 
-def train(train_loader, model, criterion, optimizer, epoch, opt):
+def train(train_loader, model, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
 
@@ -207,33 +216,16 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         data_time.update(time.time() - end)
 
         images = torch.cat([images[0], images[1]], dim=0)
-        if torch.cuda.is_available():
-            images = images.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
         bsz = labels.shape[0]
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # compute loss
-        features = model(images)
-        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-        features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-        if opt.method == 'SupCon':
-            loss = criterion(features, labels)
-        elif opt.method == 'SimCLR':
-            loss = criterion(features)
-        else:
-            raise ValueError('contrastive method not supported: {}'.
-                             format(opt.method))
+        features, loss = model(images, labels)
 
         # update metric
         losses.update(loss.item(), bsz)
-
-        # SGD
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -259,10 +251,13 @@ def main():
     train_loader = set_loader(opt)
 
     # build model and criterion
-    model, criterion = set_model(opt)
+    model = set_model(opt)
 
     # build optimizer
     optimizer = set_optimizer(opt, model)
+
+    # poptorch wrapper
+    poptorch_model = poptorch.trainingModel(model, optimizer=optimizer)
 
     # tensorboard
     logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
@@ -273,7 +268,7 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss = train(train_loader, model, criterion, optimizer, epoch, opt)
+        loss = train(train_loader, poptorch_model, optimizer, epoch, opt)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
