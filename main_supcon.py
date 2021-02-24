@@ -13,7 +13,7 @@ from torchvision import transforms, datasets
 
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
-from util import set_optimizer, save_model
+from util import pipeline_model, set_optimizer, save_model
 from networks.resnet_big import SupConResNet
 from losses import SupConLoss
 
@@ -33,12 +33,13 @@ def parse_option():
                         help='number of training epochs')
 
     # IPU options
-    parser.add_argument('--num_ipus', type=int, default=1, choices=[1, 2, 4],
-                        help='number of IPUs')
+    parser.add_argument('--pipeline_splits', nargs='+', default=['encoder/layer2/0/conv1', 'encoder/layer2/3/conv1', 'encoder/layer3/4/conv1'],
+                        help='pipeline splits')
     parser.add_argument('--gradient_accumulation', type=int, default=1,
                         help='gradient accumulation')
     parser.add_argument('--replication_factor', type=int, default=1,
                         help='replication factor')
+    parser.add_argument('--profile', action='store_true')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.05,
@@ -128,6 +129,7 @@ def parse_option():
         os.makedirs(opt.save_folder)
 
     opt.profiling = 'POPLAR_ENGINE_OPTIONS' in os.environ
+    assert len(opt.pipeline_splits) in (0, 1, 3, 7, 15)
 
     return opt
 
@@ -203,20 +205,14 @@ class ModelWithLoss(torch.nn.Module):
             raise ValueError('contrastive method not supported: {}'.
                              format(self.method))
 
-        return x, loss
+        return features, loss
 
 
 def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
-    if opt.num_ipus == 2:
-        model.encoder.layer3[0].conv1 = poptorch.BeginBlock(model.encoder.layer3[0].conv1, ipu_id=1)
-
-    if opt.num_ipus == 4:
-        model.encoder.layer2[0].conv1 = poptorch.BeginBlock(model.encoder.layer2[0].conv1, ipu_id=1)
-        model.encoder.layer3[0].conv1 = poptorch.BeginBlock(model.encoder.layer3[0].conv1, ipu_id=2)
-        model.encoder.layer4[0].conv1 = poptorch.BeginBlock(model.encoder.layer4[0].conv1, ipu_id=3)
+    pipeline_model(model, opt.pipeline_splits)
 
     model_with_loss = ModelWithLoss(model, criterion, opt.method).train()
 
@@ -273,6 +269,7 @@ def main():
     poptorch_opts = poptorch.Options()
     poptorch_opts.Training.gradientAccumulation(opt.gradient_accumulation)
     poptorch_opts.replicationFactor(opt.replication_factor)
+    poptorch_opts.Training.accumulationReductionType(poptorch.ReductionType.Mean)
 
     # build data loader
     train_loader = set_loader(opt, poptorch_opts)
@@ -308,11 +305,13 @@ def main():
         if epoch % opt.save_freq == 0:
             save_file = os.path.join(
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
+            poptorch_model.copyWeightsToHost()
             save_model(model, optimizer, opt, epoch, save_file)
 
     # save the last model
     save_file = os.path.join(
         opt.save_folder, 'last.pth')
+    poptorch_model.copyWeightsToHost()
     save_model(model, optimizer, opt, opt.epochs, save_file)
 
 
