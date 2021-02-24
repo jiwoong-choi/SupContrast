@@ -8,8 +8,8 @@ import math
 
 import tensorboard_logger as tb_logger
 import torch
-from torchvision import transforms, datasets
 import poptorch
+from torchvision import transforms, datasets
 
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
@@ -31,6 +31,14 @@ def parse_option():
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=1000,
                         help='number of training epochs')
+
+    # IPU options
+    parser.add_argument('--num_ipus', type=int, default=1, choices=[1, 2, 4],
+                        help='number of IPUs')
+    parser.add_argument('--gradient_accumulation', type=int, default=1,
+                        help='gradient accumulation')
+    parser.add_argument('--replication_factor', type=int, default=1,
+                        help='replication factor')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.05,
@@ -119,10 +127,12 @@ def parse_option():
     if not os.path.isdir(opt.save_folder):
         os.makedirs(opt.save_folder)
 
+    opt.profiling = 'POPLAR_ENGINE_OPTIONS' in os.environ
+
     return opt
 
 
-def set_loader(opt):
+def set_loader(opt, poptorch_opts: poptorch.Options):
     # construct data loader
     if opt.dataset == 'cifar10':
         mean = (0.4914, 0.4822, 0.4465)
@@ -163,9 +173,11 @@ def set_loader(opt):
         raise ValueError(opt.dataset)
 
     train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
+    train_loader = poptorch.DataLoader(
+        poptorch_opts, train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
         num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
+
+    train_loader.__len__ = lambda: len(train_dataset)
 
     return train_loader
 
@@ -177,14 +189,14 @@ class ModelWithLoss(torch.nn.Module):
         self.loss = loss
         self.method = method
 
-    def forward(self, x, label):
-        bsz = label.shape[0]
+    def forward(self, x, labels):
+        bsz = labels.shape[0]
         features = self.model(x)
         f1, f2 = torch.split(features, [bsz, bsz], dim=0)
         features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
 
         if self.method == 'SupCon':
-            loss = self.loss(features, label)
+            loss = self.loss(features, labels)
         elif self.method == 'SimCLR':
             loss = self.loss(features)
         else:
@@ -198,14 +210,21 @@ def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
-    model_with_loss = ModelWithLoss(model, criterion, opt.method)
+    if opt.num_ipus == 2:
+        model.encoder.layer3[0].conv1 = poptorch.BeginBlock(model.encoder.layer3[0].conv1, ipu_id=1)
+
+    if opt.num_ipus == 4:
+        model.encoder.layer2[0].conv1 = poptorch.BeginBlock(model.encoder.layer2[0].conv1, ipu_id=1)
+        model.encoder.layer3[0].conv1 = poptorch.BeginBlock(model.encoder.layer3[0].conv1, ipu_id=2)
+        model.encoder.layer4[0].conv1 = poptorch.BeginBlock(model.encoder.layer4[0].conv1, ipu_id=3)
+
+    model_with_loss = ModelWithLoss(model, criterion, opt.method).train()
 
     return model_with_loss
 
 
 def train(train_loader, model, optimizer, epoch, opt):
     """one epoch training"""
-    model.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -213,10 +232,13 @@ def train(train_loader, model, optimizer, epoch, opt):
 
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
+        if opt.profiling and idx > 0:
+            break
         data_time.update(time.time() - end)
 
         images = torch.cat([images[0], images[1]], dim=0)
         bsz = labels.shape[0]
+        labels = labels.int()
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
@@ -247,8 +269,13 @@ def train(train_loader, model, optimizer, epoch, opt):
 def main():
     opt = parse_option()
 
+    # poptorch options
+    poptorch_opts = poptorch.Options()
+    poptorch_opts.Training.gradientAccumulation(opt.gradient_accumulation)
+    poptorch_opts.replicationFactor(opt.replication_factor)
+
     # build data loader
-    train_loader = set_loader(opt)
+    train_loader = set_loader(opt, poptorch_opts)
 
     # build model and criterion
     model = set_model(opt)
@@ -257,13 +284,15 @@ def main():
     optimizer = set_optimizer(opt, model)
 
     # poptorch wrapper
-    poptorch_model = poptorch.trainingModel(model, optimizer=optimizer)
+    poptorch_model = poptorch.trainingModel(model, options=poptorch_opts, optimizer=optimizer)
 
     # tensorboard
     logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
+        if opt.profiling and epoch > 1:
+            break
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
