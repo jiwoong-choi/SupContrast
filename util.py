@@ -1,6 +1,5 @@
 from __future__ import print_function
 
-import logging
 import math
 import numpy as np
 import torch
@@ -15,8 +14,21 @@ def replace_layer(parent, field_name, new_layer):
         setattr(parent, field_name, new_layer)
 
 
-def get_module_and_parent_by_name(node, split_tokens):
+def replace_bn(model, norm_type, norm_num_groups=32):
+    stack = [model]
+    while len(stack) != 0:
+        node = stack.pop()
+        for name, child in node.named_children():
+            stack.append(child)
+            if isinstance(child, torch.nn.BatchNorm2d):
+                if norm_type == "group":
+                    new_layer = torch.nn.GroupNorm(norm_num_groups, child.num_features, child.eps, child.affine)
+                else:
+                    new_layer = torch.nn.Identity()
+                replace_layer(node, name, new_layer)
 
+
+def get_module_and_parent_by_name(node, split_tokens):
     child_to_find = split_tokens[0]
     for name, child in node.named_children():
         if name == child_to_find:
@@ -35,15 +47,15 @@ def pipeline_model(model, pipeline_splits):
     for name, modules in model.named_modules():
         name = name.replace('.', '/')
         if name in pipeline_splits:
-            logging.info('--------')
-        logging.info(name)
+            print('--------')
+        print(name)
 
     for split_idx, split in enumerate(pipeline_splits):
         split_tokens = split.split('/')
-        logging.info(f'Processing pipeline split {split_tokens}')
+        print(f'Processing pipeline split {split_tokens}')
         parent, node, field_or_idx_str = get_module_and_parent_by_name(model, split_tokens)
         if parent is None:
-            logging.warn(f'Split {split} not found')
+            raise Exception(f'Split {split} not found')
         else:
             replace_layer(parent, field_or_idx_str, poptorch.BeginBlock(ipu_id=split_idx+1, layer_to_call=node))
 
@@ -118,11 +130,23 @@ def warmup_learning_rate(args, epoch, batch_id, total_batches, optimizer):
 
 
 def set_optimizer(opt, model):
-    optimizer = optim.SGD(model.parameters(),
+    if opt.optimizer == 'SGD':
+        return optim.SGD(model.parameters(),
+                         lr=opt.learning_rate,
+                         momentum=opt.momentum,
+                        weight_decay=opt.weight_decay)
+    elif opt.optimizer == 'Adam':
+        return optim.Adam(model.parameters(),
                           lr=opt.learning_rate,
-                          momentum=opt.momentum,
+                          betas=opt.betas,
                           weight_decay=opt.weight_decay)
-    return optimizer
+    elif opt.optimizer == 'RMSprop':
+        return optim.RMSprop(model.parameters(),
+                              lr=opt.learning_rate,
+                              momentum=opt.momentum,
+                              weight_decay=opt.weight_decay)
+    else:
+        raise Exception(f'Unknown optimizer: {opt.optimizer}')
 
 
 def save_model(model, optimizer, opt, epoch, save_file):

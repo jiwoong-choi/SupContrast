@@ -8,12 +8,13 @@ import math
 
 import tensorboard_logger as tb_logger
 import torch
+import popart
 import poptorch
 from torchvision import transforms, datasets
 
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
-from util import pipeline_model, set_optimizer, save_model
+from util import pipeline_model, replace_bn, set_optimizer, save_model
 from networks.resnet_big import SupConResNet
 from losses import SupConLoss
 
@@ -33,15 +34,29 @@ def parse_option():
                         help='number of training epochs')
 
     # IPU options
-    parser.add_argument('--pipeline_splits', nargs='+', default=['encoder/layer2/0/conv1', 'encoder/layer2/3/conv1', 'encoder/layer3/4/conv1'],
+    parser.add_argument('--pipeline_splits', nargs='+',
+                        default=['encoder/layer2/0', 'encoder/layer2/3', 'encoder/layer3/4'],
                         help='pipeline splits')
+    parser.add_argument('--enable_pipeline_recompute', action='store_true',
+                        help='Enable the recomputation of network activations during backward pass instead of caching them during forward pass')
     parser.add_argument('--gradient_accumulation', type=int, default=1,
                         help='gradient accumulation')
     parser.add_argument('--replication_factor', type=int, default=1,
                         help='replication factor')
-    parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--memory_proportion', type=float, default=0.6,
+                        help='available memory proportion for conv and matmul')
+    parser.add_argument('--norm_type', default='batch', choices=['batch', 'group', 'none'],
+                        help='normalization layer type')
+    parser.add_argument('--norm_num_group', type=int, default=32,
+                        help='number of groups for group normalization layers')
+    parser.add_argument('--precision', default='16.16', choices=['16.16', '16.32', '32.32'],
+                        help='Precision of Ops(weights/activations/gradients) and Master data types: 16.16, 16.32, 32.32')
+    parser.add_argument('--half_partial', action='store_true',
+                        help='Accumulate matrix multiplication partials in half precision')
 
     # optimization
+    parser.add_argument('--optimizer', default='SGD', choices=['SGD', 'Adam', 'RMSprop'],
+                        help='optimizer for training')
     parser.add_argument('--learning_rate', type=float, default=0.05,
                         help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='700,800,900',
@@ -52,6 +67,8 @@ def parse_option():
                         help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum')
+    parser.add_argument('--betas', type=float, nargs=2, default=[0.9, 0.999],
+                        help='betas for Adam optimizer')
 
     # model dataset
     parser.add_argument('--model', type=str, default='resnet50')
@@ -212,9 +229,15 @@ def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
+    if opt.norm_type in ['group', 'none']:
+        replace_bn(model, 'group', opt.norm_num_group)
+
     pipeline_model(model, opt.pipeline_splits)
 
     model_with_loss = ModelWithLoss(model, criterion, opt.method).train()
+
+    if opt.precision[-3:] == ".16":
+        model.half()
 
     return model_with_loss
 
@@ -233,11 +256,14 @@ def train(train_loader, model, optimizer, epoch, opt):
         data_time.update(time.time() - end)
 
         images = torch.cat([images[0], images[1]], dim=0)
+        if opt.precision[:2] == "16":
+            images = images.half()
         bsz = labels.shape[0]
         labels = labels.int()
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
+        model.setOptimizer(optimizer)
 
         # compute loss
         features, loss = model(images, labels)
@@ -270,6 +296,14 @@ def main():
     poptorch_opts.Training.gradientAccumulation(opt.gradient_accumulation)
     poptorch_opts.replicationFactor(opt.replication_factor)
     poptorch_opts.Training.accumulationReductionType(poptorch.ReductionType.Mean)
+    poptorch_opts.setAvailableMemoryProportion({
+        f'IPU{ipu_id}': opt.memory_proportion for ipu_id in range(len(opt.pipeline_splits))
+    })
+    if opt.half_partial:
+        poptorch_opts.Popart.set("partialsTypeMatMuls", "half")
+        poptorch_opts.Popart.set("convolutionOptions", {'partialsType': 'half'})
+    if opt.enable_pipeline_recompute and len(opt.pipeline_splits) > 0:
+        poptorch_opts.Popart.set("autoRecomputation", int(popart.RecomputationType.Pipeline))
 
     # build data loader
     train_loader = set_loader(opt, poptorch_opts)
@@ -291,6 +325,7 @@ def main():
         if opt.profiling and epoch > 1:
             break
         adjust_learning_rate(opt, optimizer, epoch)
+        poptorch_model.setOptimizer(optimizer)
 
         # train for one epoch
         time1 = time.time()
