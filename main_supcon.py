@@ -34,9 +34,7 @@ def parse_option():
                         help='number of training epochs')
 
     # IPU options
-    parser.add_argument('--pipeline_splits', nargs='+',
-                        default=['encoder/layer2/0', 'encoder/layer2/3', 'encoder/layer3/4'],
-                        help='pipeline splits')
+    parser.add_argument('--pipeline_splits', nargs='+', help='pipeline splits')
     parser.add_argument('--enable_pipeline_recompute', action='store_true',
                         help='Enable the recomputation of network activations during backward pass instead of caching them during forward pass')
     parser.add_argument('--gradient_accumulation', type=int, default=1,
