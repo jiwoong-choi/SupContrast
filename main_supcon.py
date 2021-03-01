@@ -34,7 +34,7 @@ def parse_option():
                         help='number of training epochs')
 
     # IPU options
-    parser.add_argument('--pipeline_splits', nargs='+', help='pipeline splits')
+    parser.add_argument('--pipeline_splits', nargs='+', default=[], help='pipeline splits')
     parser.add_argument('--enable_pipeline_recompute', action='store_true',
                         help='Enable the recomputation of network activations during backward pass instead of caching them during forward pass')
     parser.add_argument('--gradient_accumulation', type=int, default=1,
@@ -47,7 +47,7 @@ def parse_option():
                         help='normalization layer type')
     parser.add_argument('--norm_num_group', type=int, default=32,
                         help='number of groups for group normalization layers')
-    parser.add_argument('--precision', default='16.16', choices=['16.16', '16.32', '32.32'],
+    parser.add_argument('--precision', default='32.32', choices=['16.16', '16.32', '32.32'],
                         help='Precision of Ops(weights/activations/gradients) and Master data types: 16.16, 16.32, 32.32')
     parser.add_argument('--half_partial', action='store_true',
                         help='Accumulate matrix multiplication partials in half precision')
@@ -55,6 +55,7 @@ def parse_option():
     # optimization
     parser.add_argument('--optimizer', default='SGD', choices=['SGD', 'Adam', 'RMSprop'],
                         help='optimizer for training')
+    parser.add_argument('--loss_scaling', type=float, default=1.0, help="Loss scaling factor")
     parser.add_argument('--learning_rate', type=float, default=0.05,
                         help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='700,800,900',
@@ -276,9 +277,9 @@ def train(train_loader, model, optimizer, epoch, opt):
         # print info
         if (idx + 1) % opt.print_freq == 0:
             print('Train: [{0}][{1}/{2}]\t'
-                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
+                  'BT {batch_time.val:.6f} ({batch_time.avg:.6f})\t'
+                  'DT {data_time.val:.6f} ({data_time.avg:.6f})\t'
+                  'loss {loss.val:.6f} ({loss.avg:.6f})'.format(
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses))
             sys.stdout.flush()

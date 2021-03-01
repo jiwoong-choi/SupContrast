@@ -134,17 +134,20 @@ def set_optimizer(opt, model):
         return optim.SGD(model.parameters(),
                          lr=opt.learning_rate,
                          momentum=opt.momentum,
+                         loss_scaling=opt.loss_scaling,
                         weight_decay=opt.weight_decay)
     elif opt.optimizer == 'Adam':
         return optim.Adam(model.parameters(),
                           lr=opt.learning_rate,
                           betas=opt.betas,
+                          loss_scaling=opt.loss_scaling,
                           weight_decay=opt.weight_decay)
     elif opt.optimizer == 'RMSprop':
         return optim.RMSprop(model.parameters(),
-                              lr=opt.learning_rate,
-                              momentum=opt.momentum,
-                              weight_decay=opt.weight_decay)
+                             lr=opt.learning_rate,
+                             momentum=opt.momentum,
+                             loss_scaling=opt.loss_scaling,
+                             weight_decay=opt.weight_decay)
     else:
         raise Exception(f'Unknown optimizer: {opt.optimizer}')
 
