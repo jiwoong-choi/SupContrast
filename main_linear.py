@@ -6,7 +6,7 @@ import time
 import math
 
 import torch
-import torch.backends.cudnn as cudnn
+import poptorch
 
 from main_ce import set_loader
 from util import AverageMeter
@@ -36,6 +36,9 @@ def parse_option():
                         help='number of training epochs')
 
     # optimization
+    parser.add_argument('--optimizer', default='SGD', choices=['SGD', 'Adam', 'RMSprop'],
+                        help='optimizer for training')
+    parser.add_argument('--loss_scaling', type=float, default=1.0, help="Loss scaling factor")
     parser.add_argument('--learning_rate', type=float, default=0.1,
                         help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='60,75,90',
@@ -108,31 +111,27 @@ def set_model(opt):
 
     ckpt = torch.load(opt.ckpt, map_location='cpu')
     state_dict = ckpt['model']
-
-    if torch.cuda.is_available():
-        if torch.cuda.device_count() > 1:
-            model.encoder = torch.nn.DataParallel(model.encoder)
-        else:
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                k = k.replace("module.", "")
-                new_state_dict[k] = v
-            state_dict = new_state_dict
-        model = model.cuda()
-        classifier = classifier.cuda()
-        criterion = criterion.cuda()
-        cudnn.benchmark = True
-
-        model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict)
 
     return model, classifier, criterion
 
 
-def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
-    """one epoch training"""
-    model.eval()
-    classifier.train()
+class ModelWithLoss(torch.nn.Module):
+    def __init__(self, encoder, classifier, loss):
+        super().__init__()
+        self.encoder = encoder
+        self.classifier = classifier
+        self.loss = loss
 
+    def forward(self, images, labels):
+        features = self.encoder(images)
+        output = self.classifier(features)
+        loss = self.loss(output, labels)
+        return output, loss
+
+
+def train(train_loader, training_model, optimizer, epoch, opt):
+    """one epoch training"""
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -141,29 +140,19 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
         data_time.update(time.time() - end)
-
-        images = images.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
         bsz = labels.shape[0]
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
+        training_model.setOptimizer(optimizer)
 
         # compute loss
-        with torch.no_grad():
-            features = model.encoder(images)
-        output = classifier(features.detach())
-        loss = criterion(output, labels)
+        output, loss = training_model(images, labels)
 
         # update metric
         losses.update(loss.item(), bsz)
-        acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-        top1.update(acc1[0], bsz)
-
-        # SGD
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+        # top1.update(acc1[0], bsz)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -195,8 +184,6 @@ def validate(val_loader, model, classifier, criterion, opt):
     with torch.no_grad():
         end = time.time()
         for idx, (images, labels) in enumerate(val_loader):
-            images = images.float().cuda()
-            labels = labels.cuda()
             bsz = labels.shape[0]
 
             # forward
@@ -233,18 +220,24 @@ def main():
 
     # build model and criterion
     model, classifier, criterion = set_model(opt)
+    model.eval()
+    classifier.train()
+
+    model_with_loss = ModelWithLoss(model.encoder, classifier, criterion)
 
     # build optimizer
-    optimizer = set_optimizer(opt, classifier)
+    optimizer = set_optimizer(opt, model_with_loss.classifier)
+
+    poptorch_model = poptorch.trainingModel(model_with_loss, optimizer=optimizer)
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
+        poptorch_model.setOptimizer(optimizer)
 
         # train for one epoch
         time1 = time.time()
-        loss, acc = train(train_loader, model, classifier, criterion,
-                          optimizer, epoch, opt)
+        loss, acc = train(train_loader, poptorch_model, optimizer, epoch, opt)
         time2 = time.time()
         print('Train epoch {}, total time {:.2f}, accuracy:{:.2f}'.format(
             epoch, time2 - time1, acc))

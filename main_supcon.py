@@ -304,6 +304,25 @@ def main():
     if opt.enable_pipeline_recompute and len(opt.pipeline_splits) > 0:
         poptorch_opts.Popart.set("autoRecomputation", int(popart.RecomputationType.Pipeline))
 
+    strategy = poptorch.ParallelPhasedExecution(
+        *[poptorch.Phase([str(ipu_id)]) for ipu_id in range(len(opt.pipeline_splits) + 1)]
+    )
+    for ipu_id in range(len(opt.pipeline_splits) + 1):
+        strategy.phase(ipu_id).ipus(ipu_id)
+    poptorch_opts.setExecutionStrategy(strategy)
+    poptorch_opts.TensorLocations.setWeightLocation(
+        poptorch.TensorLocationSettings().useOnChipStorage(False)
+    )
+    poptorch_opts.TensorLocations.setAccumulatorLocation(
+        poptorch.TensorLocationSettings().useOnChipStorage(False)
+    )
+    poptorch_opts.TensorLocations.setOptimizerLocation(
+        poptorch.TensorLocationSettings().useOnChipStorage(False)
+    )
+    poptorch_opts.TensorLocations.setActivationLocation(
+        poptorch.TensorLocationSettings().useOnChipStorage(False)
+    )
+
     # build data loader
     train_loader = set_loader(opt, poptorch_opts)
 
@@ -340,13 +359,13 @@ def main():
             save_file = os.path.join(
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
             poptorch_model.copyWeightsToHost()
-            save_model(model, optimizer, opt, epoch, save_file)
+            save_model(model.model, optimizer, opt, epoch, save_file)
 
     # save the last model
     save_file = os.path.join(
         opt.save_folder, 'last.pth')
     poptorch_model.copyWeightsToHost()
-    save_model(model, optimizer, opt, opt.epochs, save_file)
+    save_model(model.model, optimizer, opt, opt.epochs, save_file)
 
 
 if __name__ == '__main__':

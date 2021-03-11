@@ -46,6 +46,12 @@ def pipeline_model(model, pipeline_splits):
     """
     for name, modules in model.named_modules():
         name = name.replace('.', '/')
+        if name == 'encoder/conv1':
+            parent, node, field_or_idx_str = get_module_and_parent_by_name(model, name.split('/'))
+            if parent is None:
+                raise Exception(f'Split {name} not found')
+            else:
+                replace_layer(parent, field_or_idx_str, poptorch.BeginBlock(ipu_id=0, layer_to_call=node))
         if name in pipeline_splits:
             print('--------')
         print(name)
